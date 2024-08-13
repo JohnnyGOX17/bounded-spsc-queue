@@ -1,11 +1,13 @@
 extern crate bounded_spsc_queue;
 #[macro_use]
 extern crate criterion;
+extern crate crossbeam;
 extern crate time;
 
 use std::thread;
 
 use criterion::{Bencher, Criterion};
+use crossbeam::channel::bounded;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
@@ -13,6 +15,7 @@ use std::sync::Arc;
 criterion_group!(
     benches,
     bench_single_thread_chan,
+    bench_single_thread_chan_crossbeam,
     bench_single_thread_spsc,
     bench_threaded_chan,
     bench_threaded_spsc,
@@ -24,6 +27,10 @@ criterion_main!(benches);
 
 fn bench_single_thread_chan(c: &mut Criterion) {
     c.bench_function("bench_single_chan", bench_chan);
+}
+
+fn bench_single_thread_chan_crossbeam(c: &mut Criterion) {
+    c.bench_function("bench_single_chan_crossbeam", bench_chan_crossbeam);
 }
 
 fn bench_single_thread_spsc(c: &mut Criterion) {
@@ -52,6 +59,14 @@ fn bench_chan(b: &mut Bencher) {
         tx.send(1).unwrap();
         rx.recv().unwrap()
     });
+}
+
+fn bench_chan_crossbeam(b: &mut Bencher) {
+    let (tx, rx) = bounded::<u8>(500);
+    b.iter(|| {
+        tx.send(1).unwrap();
+        rx.recv().unwrap()
+    })
 }
 
 fn bench_chan_threaded(b: &mut Bencher) {
