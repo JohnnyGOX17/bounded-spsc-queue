@@ -17,7 +17,8 @@ criterion_group!(
     bench_threaded_chan,
     bench_threaded_spsc,
     bench_threaded_reverse_chan,
-    bench_threaded_reverse_spsc
+    bench_threaded_reverse_spsc,
+    bench_pop_n,
 );
 criterion_main!(benches);
 
@@ -60,7 +61,7 @@ fn bench_chan_threaded(b: &mut Bencher) {
 
     let flag_clone = arc_flag.clone();
     thread::spawn(move || {
-        while flag_clone.load(Ordering::Acquire) == false {
+        while !flag_clone.load(Ordering::Acquire) {
             // Try to do as much work as possible without checking the atomic
             for _ in 0..400 {
                 rx.recv().unwrap();
@@ -86,7 +87,7 @@ fn bench_chan_threaded2(b: &mut Bencher) {
 
     let flag_clone = arc_flag.clone();
     thread::spawn(move || {
-        while flag_clone.load(Ordering::Acquire) == false {
+        while !flag_clone.load(Ordering::Acquire) {
             // Try to do as much work as possible without checking the atomic
             for _ in 0..400 {
                 let _ = tx.send(1);
@@ -122,7 +123,7 @@ fn bench_spsc_threaded(b: &mut Bencher) {
 
     let flag_clone = arc_flag.clone();
     thread::spawn(move || {
-        while flag_clone.load(Ordering::Acquire) == false {
+        while !flag_clone.load(Ordering::Acquire) {
             // Try to do as much work as possible without checking the atomic
             for _ in 0..400 {
                 c.pop();
@@ -149,7 +150,7 @@ fn bench_spsc_threaded2(b: &mut Bencher) {
 
     let flag_clone = arc_flag.clone();
     thread::spawn(move || {
-        while flag_clone.load(Ordering::Acquire) == false {
+        while !flag_clone.load(Ordering::Acquire) {
             // Try to do as much work as possible without checking the atomic
             for _ in 0..400 {
                 p.push(1);
@@ -166,4 +167,50 @@ fn bench_spsc_threaded2(b: &mut Bencher) {
     for _ in 0..400 {
         c.try_pop();
     }
+}
+
+fn bench_pop_n(b: &mut Criterion) {
+    b.bench_function("pop_n_via_pop", |b| {
+        b.iter_with_setup(
+            || {
+                let (p, c) = bounded_spsc_queue::make(500);
+                for i in 0..500 {
+                    p.push(i)
+                }
+                c
+            },
+            |c| {
+                for _ in 0..500 {
+                    c.pop();
+                }
+            },
+        )
+    });
+
+    b.bench_function("pop_n", |b| {
+        let mut buf = [0; 500];
+        b.iter_with_setup(
+            || {
+                let (p, c) = bounded_spsc_queue::make(500);
+                for i in 0..500 {
+                    p.push(i)
+                }
+                c
+            },
+            |c| c.pop_n(&mut buf),
+        )
+    });
+
+    b.bench_function("pop_n_overlapping", |b| {
+        let mut buf = [0; 500];
+        let (p, c) = bounded_spsc_queue::make(500);
+        b.iter_with_setup(
+            || {
+                for i in 0..500 {
+                    p.push(i)
+                }
+            },
+            move |_| c.pop_n(&mut buf),
+        )
+    });
 }

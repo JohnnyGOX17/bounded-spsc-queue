@@ -1,14 +1,12 @@
-#![feature(allocator_api)]
-
 extern crate core;
 
 use core::alloc::Layout;
 use core::{mem, ptr};
 use std::alloc;
 use std::cell::Cell;
+use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::usize;
 
 const CACHELINE_LEN: usize = 64;
 
@@ -52,14 +50,33 @@ pub struct Buffer<T> {
     _padding3: [usize; cacheline_pad!(2)],
 }
 
+impl<T> fmt::Debug for Buffer<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Relaxed);
+        let shead = self.shadow_head.get();
+
+        f.debug_struct("SPSC Buffer")
+            .field("buffer_addr:", &self.buffer)
+            .field("capacity:", &self.capacity)
+            .field("allocated_size:", &self.allocated_size)
+            .field("consumer_head:", &head)
+            .field("producer_tail:", &tail)
+            .field("shadow_head:", &shead)
+            .finish()
+    }
+}
+
 unsafe impl<T: Sync> Sync for Buffer<T> {}
 
 /// A handle to the queue which allows consuming values from the buffer
+#[derive(Debug)]
 pub struct Consumer<T> {
     buffer: Arc<Buffer<T>>,
 }
 
 /// A handle to the queue which allows adding values onto the buffer
+#[derive(Debug)]
 pub struct Producer<T> {
     buffer: Arc<Buffer<T>>,
 }
@@ -147,6 +164,57 @@ impl<T> Buffer<T> {
         }
     }
 
+    /// Attempts to pop at most `target.len()` values off the buffer.
+    ///
+    /// Returns the amount of values successfully popped.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut target = [0; 1024];
+    /// let popped = buffer.pop_n(&mut target);
+    /// ```
+    pub fn pop_n(&self, target: &mut [T]) -> usize {
+        let current_head = self.head.load(Ordering::Relaxed);
+
+        self.shadow_tail.set(self.tail.load(Ordering::Acquire));
+        if current_head == self.shadow_tail.get() {
+            return 0;
+        }
+
+        let mut diff = self.shadow_tail.get().wrapping_sub(current_head);
+        if diff > target.len() {
+            diff = target.len()
+        }
+
+        let start = current_head & (self.allocated_size - 1);
+        let mut mid_point = self.allocated_size - start;
+        let rest;
+        if mid_point > diff {
+            mid_point = diff;
+            rest = 0;
+        } else {
+            rest = diff as isize - mid_point as isize;
+        };
+
+        unsafe {
+            ptr::copy_nonoverlapping(self.buffer.add(start), target.as_mut_ptr(), mid_point);
+
+            if rest > 0 {
+                ptr::copy_nonoverlapping(
+                    self.buffer,
+                    target.as_mut_ptr().add(mid_point),
+                    rest as usize,
+                )
+            }
+        }
+
+        self.head
+            .store(current_head.wrapping_add(diff), Ordering::Release);
+
+        diff
+    }
+
     /// Attempt to push a value onto the buffer.
     ///
     /// If the buffer is full, this method will not block.  Instead, it will return `Some(v)`, where
@@ -216,8 +284,7 @@ impl<T> Buffer<T> {
     /// buffer wrapping is handled inside the method.
     #[inline]
     unsafe fn load(&self, pos: usize) -> &T {
-        &*self.buffer
-            .offset((pos & (self.allocated_size - 1)) as isize)
+        &*self.buffer.add(pos & (self.allocated_size - 1))
     }
 
     /// Store a value in the buffer
@@ -228,8 +295,7 @@ impl<T> Buffer<T> {
     /// - Initialized a valid block of memory
     #[inline]
     unsafe fn store(&self, pos: usize, v: T) {
-        let end = self.buffer
-            .offset((pos & (self.allocated_size - 1)) as isize);
+        let end = self.buffer.add(pos & (self.allocated_size - 1));
         ptr::write(&mut *end, v);
     }
 }
@@ -242,14 +308,15 @@ impl<T> Drop for Buffer<T> {
 
         // TODO this could be optimized to avoid the atomic operations / book-keeping...but
         // since this is the destructor, there shouldn't be any contention... so meh?
-        while let Some(_) = self.try_pop() {}
+        while self.try_pop().is_some() {}
 
-        unsafe {
+        if mem::size_of::<T>() > 0 {
             let layout = Layout::from_size_align(
                 self.allocated_size * mem::size_of::<T>(),
                 mem::align_of::<T>(),
-            ).unwrap();
-            alloc::dealloc(self.buffer as *mut u8, layout);
+            )
+            .unwrap();
+            unsafe { alloc::dealloc(self.buffer as *mut u8, layout) };
         }
     }
 }
@@ -342,11 +409,17 @@ unsafe fn allocate_buffer<T>(capacity: usize) -> *mut T {
         .expect("capacity overflow");
 
     let layout = Layout::from_size_align(size, mem::align_of::<T>()).unwrap();
-    let ptr = alloc::alloc(layout);
+
+    let ptr = if size > 0 {
+        alloc::alloc(layout) as *mut T
+    } else {
+        mem::align_of::<T>() as *mut T
+    };
+
     if ptr.is_null() {
         alloc::handle_alloc_error(layout)
     } else {
-        ptr as *mut T
+        ptr
     }
 }
 
@@ -406,7 +479,7 @@ impl<T> Producer<T> {
     /// assert!(producer.capacity() == 100);
     /// ```
     pub fn capacity(&self) -> usize {
-        (*self.buffer).capacity
+        self.buffer.capacity
     }
 
     /// Returns the current size of the queue
@@ -424,7 +497,7 @@ impl<T> Producer<T> {
     /// assert!(producer.size() == 1);
     /// ```
     pub fn size(&self) -> usize {
-        (*self.buffer).tail.load(Ordering::Acquire) - (*self.buffer).head.load(Ordering::Acquire)
+        self.buffer.tail.load(Ordering::Acquire) - self.buffer.head.load(Ordering::Acquire)
     }
 
     /// Returns the available space in the queue
@@ -513,6 +586,25 @@ impl<T> Consumer<T> {
     pub fn skip_n(&self, n: usize) -> usize {
         (*self.buffer).skip_n(n)
     }
+
+    /// Attempts to pop at most `target.len()` values off the buffer.
+    ///
+    /// Returns the amount of values successfully popped.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bounded_spsc_queue::*;
+    ///
+    /// let (_, consumer) = make(100);
+    ///
+    /// let mut buffer = [0; 512];
+    /// let popped = consumer.pop_n(&mut buffer); // try to pop at most 512 elements
+    /// ```
+    pub fn pop_n(&self, target: &mut [T]) -> usize {
+        (*self.buffer).pop_n(target)
+    }
+
     /// Returns the total capacity of this queue
     ///
     /// This value represents the total capacity of the queue when it is full.  It does not
@@ -528,7 +620,7 @@ impl<T> Consumer<T> {
     /// assert!(producer.capacity() == 100);
     /// ```
     pub fn capacity(&self) -> usize {
-        (*self.buffer).capacity
+        self.buffer.capacity
     }
 
     /// Returns the current size of the queue
@@ -548,7 +640,7 @@ impl<T> Consumer<T> {
     /// assert!(producer.size() == 9);
     /// ```
     pub fn size(&self) -> usize {
-        (*self.buffer).tail.load(Ordering::Acquire) - (*self.buffer).head.load(Ordering::Acquire)
+        self.buffer.tail.load(Ordering::Acquire) - self.buffer.head.load(Ordering::Acquire)
     }
 }
 
@@ -644,7 +736,7 @@ mod tests {
             Some(v) => {
                 assert!(v == 10);
             }
-            None => assert!(false, "Queue should not have accepted another write!"),
+            None => panic!("Queue should not have accepted another write!"),
         }
     }
 
@@ -652,22 +744,20 @@ mod tests {
     fn test_try_poll() {
         let (p, c) = super::make(10);
 
-        match c.try_pop() {
-            Some(_) => assert!(false, "Queue was empty but a value was read!"),
-            None => {}
+        if c.try_pop().is_some() {
+            panic!("Queue was empty but a value was read!")
         }
 
         p.push(123);
 
         match c.try_pop() {
             Some(v) => assert!(v == 123),
-            None => assert!(false, "Queue was not empty but poll() returned nothing!"),
+            None => panic!("Queue was not empty but poll() returned nothing!"),
         }
 
-        match c.try_pop() {
-            Some(_) => assert!(false, "Queue was empty but a value was read!"),
-            None => {}
-        }
+        if c.try_pop().is_some() {
+            panic!("Queue was empty but a value was read!")
+        };
     }
 
     #[test]
@@ -683,6 +773,68 @@ mod tests {
         for i in 0..100000 {
             let t = c.pop();
             assert!(t == i);
+        }
+    }
+
+    #[test]
+    fn test_pop_n() {
+        {
+            let (p, c) = super::make(500);
+            for _ in 0..500 {
+                for i in 0..500 {
+                    p.push(i)
+                }
+
+                let mut buf = vec![0; 500];
+
+                assert_eq!(c.pop_n(&mut buf[..]), 500);
+                assert_eq!(buf, (0..500).collect::<Vec<_>>());
+            }
+        }
+
+        {
+            let (p, c) = super::make(8);
+            for i in 0..8 {
+                p.push(i)
+            }
+
+            let mut buf = vec![0; 8];
+            assert_eq!(c.pop_n(&mut buf[..]), 8);
+            assert_eq!(buf, (0..8).collect::<Vec<_>>());
+        }
+
+        {
+            let (p, c) = super::make(500);
+            for i in 0..500 {
+                p.push(i)
+            }
+
+            {
+                let mut buf = [0, 0, 0];
+
+                assert_eq!(c.pop_n(&mut buf), 3);
+                assert_eq!(c.size(), 497);
+                assert_eq!(buf, [0, 1, 2]);
+
+                assert_eq!(c.pop_n(&mut buf), 3);
+                assert_eq!(c.size(), 494);
+                assert_eq!(buf, [3, 4, 5]);
+
+                c.pop();
+                c.pop();
+
+                assert_eq!(c.pop_n(&mut buf), 3);
+                assert_eq!(c.size(), 489);
+                assert_eq!(buf, [8, 9, 10]);
+            }
+
+            {
+                let mut buf = [0; 1000];
+                let expected = 489;
+                assert_eq!(c.pop_n(&mut buf), expected);
+                assert_eq!(c.size(), 0);
+                assert_eq!(&buf[..expected], &(11..500).collect::<Vec<_>>()[..]);
+            }
         }
     }
 
@@ -737,5 +889,4 @@ mod tests {
             (start.to(end)).num_nanoseconds().unwrap()
         );
     }
-
 }
